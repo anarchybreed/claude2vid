@@ -36,20 +36,43 @@ function findConst(src, name) {
   return m ? Number(m[1]) : null;
 }
 
-// Scan htmlPath and its sibling .jsx/.js files for `<Stage width={…} height={…} duration={…}>`-style props.
+// Directories that won't contain Claude Design source — skipped by the walker.
+const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'out', 'coverage']);
+const MAX_WALK_DEPTH = 3;
+
+async function walkJsxLike(rootDir) {
+  const found = [];
+  async function visit(absDir, relDir, depth) {
+    let entries;
+    try { entries = await fs.readdir(absDir, { withFileTypes: true }); }
+    catch { return; }
+    for (const ent of entries) {
+      if (ent.isDirectory()) {
+        if (depth >= MAX_WALK_DEPTH) continue;
+        if (ent.name.startsWith('.') || SKIP_DIRS.has(ent.name)) continue;
+        await visit(path.join(absDir, ent.name), path.posix.join(relDir, ent.name), depth + 1);
+      } else if (ent.isFile() && /\.(jsx?|mjs)$/i.test(ent.name)) {
+        found.push(path.posix.join(relDir, ent.name));
+      }
+    }
+  }
+  await visit(rootDir, '', 0);
+  return found;
+}
+
+// Scan htmlPath and JSX/JS files within its directory (recursive, bounded) for
+// `<Stage width={…} height={…} duration={…}>`-style props.
 // Returns { width?, height?, duration? } — missing keys mean we couldn't find it.
 export async function detectMeta(htmlPath) {
   const dir = path.dirname(htmlPath);
-  const entries = await fs.readdir(dir);
-  const candidates = [
-    path.basename(htmlPath),
-    ...entries.filter(f => /\.(jsx?|mjs)$/i.test(f)),
-  ];
+  const jsxRelPaths = await walkJsxLike(dir);
+  const candidates = [path.basename(htmlPath), ...jsxRelPaths];
 
-  // Read all sources up-front so we can resolve cross-file identifiers.
+  // Read all sources up-front so we can resolve cross-file identifiers. Keys
+  // are relative paths (e.g. "scenes/App.jsx") to avoid basename collisions.
   const sources = {};
-  for (const name of candidates) {
-    try { sources[name] = stripComments(await fs.readFile(path.join(dir, name), 'utf8')); }
+  for (const relPath of candidates) {
+    try { sources[relPath] = stripComments(await fs.readFile(path.join(dir, relPath), 'utf8')); }
     catch { /* ignore */ }
   }
 
