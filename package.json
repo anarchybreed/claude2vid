@@ -1,0 +1,32 @@
+{
+  "name": "claude2vid",
+  "version": "0.1.0",
+  "description": "Convert Claude Design HTML/JS animations into YouTube-ready MP4 videos via headless Chromium + virtual clock + ffmpeg.",
+  "type": "module",
+  "bin": {
+    "claude2vid": "src/cli.js"
+  },
+  "scripts": {
+    "render:smoke": "node src/cli.js render \"examples/cosmic-zoom/Cosmic Zoom.html\" --fps 30 --duration 5 -o out-smoke.mp4",
+    "render:full": "node src/cli.js render \"examples/cosmic-zoom/Cosmic Zoom.html\" -o out-full.mp4"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "ffmpeg-static": "^5.2.0",
+    "puppeteer": "^25.1.0"
+  },
+  "keywords": [
+    "claude",
+    "claude-design",
+    "video",
+    "render",
+    "puppeteer",
+    "ffmpeg",
+    "animation",
+    "html-to-video"
+  ],
+  "license": "MIT"
+}

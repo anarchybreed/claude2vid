@@ -1,0 +1,9 @@
+node_modules/
+out-*.mp4
+*.log
+frames/
+.DS_Store
+*.mp4
+*.mov
+examples/
+*.wav
