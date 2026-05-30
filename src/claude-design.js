@@ -9,10 +9,13 @@ import path from 'node:path';
 
 const NUM = String.raw`(\d+(?:\.\d+)?)`;
 
-// Property inside a JSX-style Stage tag: matches both `width={1080}` (literal)
-// and `duration={DURATION}` (identifier — we resolve the const separately).
+// Property inside a JSX-style Stage tag. Three forms supported:
+//   width={1080}           → PROP_LITERAL
+//   duration={DURATION}    → PROP_IDENT  (resolved via `const DURATION = N`)
+//   width={VB.frameW}      → PROP_MEMBER (resolved via `const VB = { frameW: N, ... }`)
 const PROP_LITERAL = (prop) => new RegExp(`\\b${prop}\\s*=\\s*\\{\\s*${NUM}\\s*\\}`);
 const PROP_IDENT   = (prop) => new RegExp(`\\b${prop}\\s*=\\s*\\{\\s*([A-Za-z_$][\\w$]*)\\s*\\}`);
+const PROP_MEMBER  = (prop) => new RegExp(`\\b${prop}\\s*=\\s*\\{\\s*([A-Za-z_$][\\w$]*)\\s*\\.\\s*([A-Za-z_$][\\w$]*)\\s*\\}`);
 
 // Strip JS line/block comments before searching, so we don't match Stage props
 // that appear in usage-example comments (animations.jsx has one).
@@ -22,17 +25,31 @@ function stripComments(src) {
     .replace(/(^|[^:])\/\/[^\n]*/g, '$1');
 }
 
-// Pull a `<Stage ...>` open tag (may span lines) out of a source string.
+// Pull a `<Stage ...>` open tag (may span lines) out of a source string. The
+// name match is loose (any identifier containing "Stage") so aliased imports
+// like `<StageA>` or `<MyStage>` are still recognised — Claude Design exports
+// sometimes rename the global Stage to avoid in-scope shadowing.
 function findStageOpenTag(src) {
-  // Non-greedy match from `<Stage` to the next `>` that closes the open tag.
-  // Allow `/>` self-closing too.
-  const m = src.match(/<Stage\b[\s\S]*?\/?>/);
+  // Non-greedy match from `<\w*Stage\w*` to the next `>` that closes the open
+  // tag. Allow `/>` self-closing too.
+  const m = src.match(/<\w*Stage\w*\b[\s\S]*?\/?>/);
   return m ? m[0] : null;
 }
 
 // Resolve `const FOO = 45` style constants.
 function findConst(src, name) {
   const m = src.match(new RegExp(`(?:const|let|var)\\s+${name}\\s*=\\s*${NUM}\\b`));
+  return m ? Number(m[1]) : null;
+}
+
+// Resolve `const OBJ = { ..., PROP: 1080, ... }` style numeric members.
+// Non-greedy match from the object opener to the prop — fine for the typical
+// "all-primitive token bag" Claude Design helper objects.
+function findObjectMember(src, objName, propName) {
+  const re = new RegExp(
+    `(?:const|let|var)\\s+${objName}\\s*=\\s*\\{[\\s\\S]*?\\b${propName}\\s*:\\s*${NUM}\\b`
+  );
+  const m = src.match(re);
   return m ? Number(m[1]) : null;
 }
 
@@ -94,6 +111,17 @@ export async function detectMeta(htmlPath) {
           const there = findConst(other, ident[1]);
           if (there != null) { result[prop] = there; break; }
         }
+        if (result[prop] != null) continue;
+      }
+      const member = tag.match(PROP_MEMBER(prop));
+      if (member) {
+        const [, obj, field] = member;
+        const here = findObjectMember(src, obj, field);
+        if (here != null) { result[prop] = here; continue; }
+        for (const other of Object.values(sources)) {
+          const there = findObjectMember(other, obj, field);
+          if (there != null) { result[prop] = there; break; }
+        }
       }
     }
     if (result.width != null && result.height != null && result.duration != null) break;
@@ -125,7 +153,7 @@ export async function detectMeta(htmlPath) {
 // because many users want the playback bar visible.
 //
 // The Stage's outer container looks like:
-//   <div id="root">
+//   <div id="root|vbroot|...">     ← React mount target (id varies per export)
 //     <div>                        ← Stage outer (position: absolute, inset: 0)
 //       <div>                      ← canvas wrapper (flex: 1)
 //         <div ref={canvasRef}>... ← the actual canvas (transform: scale(s))
@@ -133,20 +161,24 @@ export async function detectMeta(htmlPath) {
 //       <PlaybackBar />            ← the chrome we hide
 //     </div>
 //   </div>
+//
+// Selector uses `body > div[id]` rather than a fixed `#root` because the mount
+// id is not stable across Claude Design exports (e.g. `#root`, `#vbroot`).
+// The React mount target always carries an id; sibling <script> tags don't.
 export const chromeHideCSS = `
 /* Hide Stage playback bar (structural: second direct child of Stage outer) */
-#root > div > div:nth-child(2),
-#root > div > *:last-child:not(:first-child) { display: none !important; }
+body > div[id] > div > div:nth-child(2),
+body > div[id] > div > *:last-child:not(:first-child) { display: none !important; }
 
 /* Reset the Stage's auto-scale transform so the canvas renders at native
    pixels. Scoped to the canvas wrapper specifically (Stage outer's first child)
    so we don't disturb scene-level transforms (e.g. the Anchor zoom in the
    "Cosmic Scale Zoom Reverse" example, which uses inline transform: scale() on
    scene divs and would otherwise be flattened). */
-#root > div > div:first-child > div { transform: none !important; }
-#root > div > div:first-child { align-items: stretch !important; justify-content: stretch !important; }
+body > div[id] > div > div:first-child > div { transform: none !important; }
+body > div[id] > div > div:first-child { align-items: stretch !important; justify-content: stretch !important; }
 
 /* Full-bleed root */
-html, body, #root { width: 100% !important; height: 100% !important; margin: 0 !important; padding: 0 !important; background: #000 !important; }
-#root > div { background: transparent !important; }
+html, body, body > div[id] { width: 100% !important; height: 100% !important; margin: 0 !important; padding: 0 !important; background: #000 !important; }
+body > div[id] > div { background: transparent !important; }
 `;
