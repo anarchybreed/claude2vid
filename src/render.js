@@ -48,26 +48,19 @@ export async function render({
 
   await fs.access(inputAbs); // throws if missing
 
-  // Resolve dimensions/duration: CLI > detected > defaults.
+  // Resolve provisional dimensions: CLI > file-scanned > defaults.
+  // Duration may still be null at this point — Contract B pages declare it
+  // via window.__vb (read after page load), so we defer that check.
   const detected = await detectMeta(inputAbs);
-  const finalWidth  = Number(width  ?? detected.width  ?? DEFAULTS.width);
-  const finalHeight = Number(height ?? detected.height ?? DEFAULTS.height);
-
-  // Duration has no safe default — silently truncating output is the worst UX.
-  // If neither the CLI nor auto-detection gave us a value, bail with a clear message.
-  if (duration == null && detected.duration == null) {
-    throw new Error(
-      `could not determine animation duration.\n` +
-      `  The input HTML doesn't expose a <Stage duration={...}> prop, and no --duration flag was given.\n` +
-      `  Pass --duration <seconds> to set it explicitly (e.g. --duration 30).`
-    );
-  }
-  const finalDuration = Number(duration ?? detected.duration);
-  const finalOutput   = output ?? path.join(inputDir, inputFile.replace(/\.[^.]+$/, '') + '.mp4');
+  let finalWidth   = Number(width  ?? detected.width  ?? DEFAULTS.width);
+  let finalHeight  = Number(height ?? detected.height ?? DEFAULTS.height);
+  let finalDuration = duration != null ? Number(duration)
+                    : detected.duration != null ? Number(detected.duration)
+                    : null;
+  const finalOutput = output ?? path.join(inputDir, inputFile.replace(/\.[^.]+$/, '') + '.mp4');
 
   log(verbose, `input:    ${inputAbs}`);
   log(verbose, `detected: ${JSON.stringify(detected)}`);
-  log(verbose, `using:    ${finalWidth}x${finalHeight} @ ${fps}fps, ${finalDuration}s`);
   log(verbose, `output:   ${finalOutput}`);
   log(verbose, `hideChrome: ${hideChrome}`);
 
@@ -86,6 +79,17 @@ export async function render({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--hide-scrollbars'],
   });
+
+  // Capture-mode audio shim sizes its OfflineAudioContext at injection time,
+  // which is before page load — so it needs duration up-front. Resolve via
+  // CLI/file scan only for this code path; Contract B pages can't combine
+  // --capture-page-audio with __vb-supplied duration.
+  if (capturePageAudio && finalDuration == null) {
+    throw new Error(
+      `--capture-page-audio requires a known duration before page load.\n` +
+      `  Pass --duration <seconds> (window.__vb.duration is read too late for audio sizing).`
+    );
+  }
 
   try {
     const page = await browser.newPage();
@@ -108,7 +112,10 @@ export async function render({
       page.on('pageerror', e => console.error('[pageerror]', e.message));
     }
 
-    const url = `${server.url}/${encodeURIComponent(inputFile)}`;
+    // Always append ?export=1 — Contract B pages key off this to hide their
+    // own chrome, skip localStorage, and autoplay from t=0. Pages that don't
+    // handle it ignore the param.
+    const url = `${server.url}/${encodeURIComponent(inputFile)}?export=1`;
     log(verbose, `goto: ${url}`);
     await page.goto(url, { waitUntil: 'networkidle0', timeout: 60_000 });
 
@@ -119,9 +126,49 @@ export async function render({
       { timeout: 30_000 }
     );
 
-    // Apply optional CSS overrides.
+    // Contract B: read window.__vb if the page exposed it. Page-declared
+    // dims/duration take precedence over file-scanned values, but CLI flags
+    // still win. fps from __vb is read but only adopted if --fps wasn't
+    // overridden (we can't distinguish "user passed --fps 60" from "default";
+    // safest is to honour __vb.fps only when it differs from the default).
+    const vb = await page.evaluate(() => {
+      const v = window.__vb;
+      if (!v || typeof v !== 'object') return null;
+      const num = (x) => (Number.isFinite(Number(x)) ? Number(x) : null);
+      return { width: num(v.width), height: num(v.height), duration: num(v.duration), fps: num(v.fps) };
+    });
+
+    if (vb) {
+      log(verbose, `__vb:     ${JSON.stringify(vb)}`);
+      const newW = width  != null ? finalWidth  : (vb.width  ?? finalWidth);
+      const newH = height != null ? finalHeight : (vb.height ?? finalHeight);
+      if (duration == null && vb.duration != null) finalDuration = vb.duration;
+      if (newW !== finalWidth || newH !== finalHeight) {
+        finalWidth = newW;
+        finalHeight = newH;
+        await page.setViewport({ width: finalWidth, height: finalHeight, deviceScaleFactor: 1 });
+      }
+    }
+
+    // Now enforce the duration check — both Contract A and B have had their say.
+    if (finalDuration == null) {
+      throw new Error(
+        `could not determine animation duration.\n` +
+        `  The input HTML exposes neither a <Stage duration={...}> prop nor a window.__vb.duration value,\n` +
+        `  and no --duration flag was given.\n` +
+        `  Pass --duration <seconds> to set it explicitly (e.g. --duration 30).`
+      );
+    }
+    log(verbose, `using:    ${finalWidth}x${finalHeight} @ ${fps}fps, ${finalDuration}s`);
+
+    // Contract B pages handle their own chrome via ?export=1. Skip the
+    // harness CSS injection — it targets the React Stage DOM shape and will
+    // mis-hide content on hand-rolled layouts.
+    if (vb && hideChrome) {
+      log(verbose, `--hide-chrome ignored: page exposes window.__vb and handles chrome via ?export=1`);
+    }
     const cssBlobs = [];
-    if (hideChrome) cssBlobs.push(chromeHideCSS);
+    if (hideChrome && !vb) cssBlobs.push(chromeHideCSS);
     if (customCss) cssBlobs.push(customCss);
     if (cssBlobs.length) {
       await page.addStyleTag({ content: cssBlobs.join('\n') });
@@ -130,9 +177,24 @@ export async function render({
     // Prime the rAF loop: many animation loops (including the Stage example)
     // skip their first frame's delta because lastTsRef starts null. Calling
     // __advanceFrame(0) lets the first rAF run, set its baseline, and re-queue
-    // — so frame 1 onwards reports a correct dt.
+    // — so frame 1 onwards reports a correct dt. Also flushes any boot-time
+    // setTimeout(0) / rAF callbacks the page queued, which is how Contract B
+    // pages flip __vbReady under the virtual clock.
     await page.evaluate(() => window.__advanceFrame(0));
     await flushRealMacrotasks(page);
+
+    // Contract B: now wait for the page's own first-paint signal. The prime
+    // tick above should have fired the page's markReady() callbacks (rAF +
+    // setTimeout(0) both drain on the first __advanceFrame). 10s cap so we
+    // don't hang if the page never sets it.
+    if (vb) {
+      try {
+        await page.waitForFunction(() => window.__vbReady === true, { timeout: 10_000 });
+        log(verbose, `__vbReady: ok`);
+      } catch {
+        log(verbose, `__vbReady: never set within 10s — proceeding anyway`);
+      }
+    }
 
     // If any audio path is requested (capture or replacement), render video to
     // a temp file first and mux audio in at the end. Otherwise write straight

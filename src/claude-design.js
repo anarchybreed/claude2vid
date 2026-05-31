@@ -26,13 +26,17 @@ function stripComments(src) {
 }
 
 // Pull a `<Stage ...>` open tag (may span lines) out of a source string. The
-// name match is loose (any identifier containing "Stage") so aliased imports
-// like `<StageA>` or `<MyStage>` are still recognised — Claude Design exports
-// sometimes rename the global Stage to avoid in-scope shadowing.
+// name match is loose (any identifier containing "Stage", optionally namespaced
+// via `.`) so all of these are recognised:
+//   <Stage ...>            (direct)
+//   <StageA ...>           (alias)
+//   <MyStage ...>          (alias with prefix)
+//   <window.Stage ...>     (member-expression component)
+//   <ns.Foo.Stage ...>     (nested namespace)
 function findStageOpenTag(src) {
-  // Non-greedy match from `<\w*Stage\w*` to the next `>` that closes the open
-  // tag. Allow `/>` self-closing too.
-  const m = src.match(/<\w*Stage\w*\b[\s\S]*?\/?>/);
+  // Non-greedy match from `<[\w.]*Stage[\w.]*` to the next `>` that closes the
+  // open tag. Allow `/>` self-closing too.
+  const m = src.match(/<[\w.]*Stage[\w.]*\b[\s\S]*?\/?>/);
   return m ? m[0] : null;
 }
 
