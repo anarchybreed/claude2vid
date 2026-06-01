@@ -331,8 +331,18 @@ export async function render({
         await muxVideoAudio({ videoPath: videoTarget, audioPath: audioTmp, outputPath: finalOutput, verbose });
         await fs.unlink(audioTmp).catch(() => {});
       } else {
-        // No audio was produced — just promote the video temp to the final output.
-        await fs.rename(videoTarget, finalOutput);
+        // No audio was produced — promote the video temp to the final output.
+        // rename() is atomic within a volume but fails (EXDEV) across drives;
+        // fall back to copy + unlink so output paths on different volumes work.
+        try {
+          await fs.rename(videoTarget, finalOutput);
+        } catch (err) {
+          if (err.code === 'EXDEV') {
+            await fs.copyFile(videoTarget, finalOutput);
+          } else {
+            throw err;
+          }
+        }
       }
       await fs.unlink(videoTarget).catch(() => {});
     }
